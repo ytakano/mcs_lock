@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicPtr, Ordering};
 use std::sync::Arc;
 
 struct MCSLock<T> {
@@ -33,22 +33,23 @@ impl<T> MCSLock<T> {
         };
 
         let ptr = &mut guard.node as *mut MCSNode<T>;
-        let prev = self.last.swap(ptr, Ordering::SeqCst);
+        let prev = self.last.swap(ptr, Ordering::Relaxed);
 
         // 最後尾がnullの場合は誰もロックを獲得しようとしていないためロック獲得
         // null以外の場合は、自身をキューの最後尾に追加
         if prev != null_mut() {
             // ロック獲得中と設定
-            guard.node.locked.store(true, Ordering::SeqCst);
+            guard.node.locked.store(true, Ordering::Relaxed);
 
             // 自身をキューの最後尾に追加
             let prev = unsafe { &*prev };
-            prev.next.store(ptr, Ordering::SeqCst);
+            prev.next.store(ptr, Ordering::Relaxed);
 
             // 他のスレッドからfalseに設定されるまでスピン
-            while guard.node.locked.load(Ordering::SeqCst) {}
+            while guard.node.locked.load(Ordering::Relaxed) {}
         }
 
+        fence(Ordering::Acquire);
         guard
     }
 }
@@ -64,12 +65,12 @@ struct MCSLockGuard<'a, T> {
 impl<'a, T> Drop for MCSLockGuard<'a, T> {
     fn drop(&mut self) {
         // 自身の次のノードがnullかつ自身が最後尾のノードなら、最後尾をnullに設定
-        if self.node.next.load(Ordering::SeqCst) == null_mut() {
+        if self.node.next.load(Ordering::Relaxed) == null_mut() {
             let ptr = &mut self.node as *mut MCSNode<T>;
             if let Ok(_) = self.mcs_lock.last.compare_exchange(
                 ptr,
                 null_mut(),
-                Ordering::SeqCst,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 return;
@@ -77,14 +78,11 @@ impl<'a, T> Drop for MCSLockGuard<'a, T> {
         }
 
         // 自身の次のスレッドがlock関数実行中なので、その終了を待機
-        while self.node.next.load(Ordering::SeqCst) == null_mut() {}
+        while self.node.next.load(Ordering::Relaxed) == null_mut() {}
 
         // 自身の次のスレッドを実行可能に設定
-        let next = unsafe { &mut *self.node.next.load(Ordering::SeqCst) };
-        next.locked.store(false, Ordering::SeqCst);
-
-        // ノードを初期化
-        self.node.next.store(null_mut(), Ordering::SeqCst);
+        let next = unsafe { &mut *self.node.next.load(Ordering::Relaxed) };
+        next.locked.store(false, Ordering::Release);
     }
 }
 
@@ -105,7 +103,7 @@ impl<'a, T> DerefMut for MCSLockGuard<'a, T> {
 }
 
 const NUM_THREADS: usize = 4;
-const NUM_LOOP: usize = 1000000;
+const NUM_LOOP: usize = 200000000;
 
 fn main() {
     let lock = Arc::new(MCSLock::new(0));
